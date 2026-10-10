@@ -635,7 +635,7 @@ app.post('/api/process', authenticateLicense, (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.post('/api/activate', async (req, res) => {
-  const { licenseKey, email } = req.body;
+  const { licenseKey, email, companyName, company, phone, tier } = req.body;
   if (!licenseKey || typeof licenseKey !== 'string') {
     return res.status(400).json({ valid: false, message: 'License key is required.' });
   }
@@ -724,6 +724,20 @@ app.post('/api/activate', async (req, res) => {
       }
     }
 
+    // Auto-sync registration into key_registrations if customer details were provided
+    if (email || companyName || company) {
+      const regClient = supabaseCustomers || supabaseLicenses;
+      if (regClient) {
+        syncKeyRegistration(regClient, {
+          licenseKey: cleanKey,
+          companyName: companyName || company || '',
+          email: email || '',
+          phone: phone || '',
+          tier: record.tier || tier || 'PRO'
+        }).catch((e) => console.warn('[Auto-sync registration during activation warning]:', e.message));
+      }
+    }
+
     const daysRemaining = Math.max(1, Math.ceil((new Date(finalExpiry).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
 
     return res.status(200).json({
@@ -740,60 +754,170 @@ app.post('/api/activate', async (req, res) => {
   }
 });
 
-app.post('/api/register', async (req, res) => {
-  const { companyName, email, phone, licenseKey, tier } = req.body;
-  const targetClient = supabaseCustomers || supabaseLicenses;
+// -----------------------------------------------------------------------------
+// Helper: Multi-Database Registration Synchronizer
+// Handles all dashboard column variations ('key' vs 'license_key', 'company' vs 'company_name', 'tier' vs 'plan')
+// -----------------------------------------------------------------------------
+async function syncKeyRegistration(client, regData) {
+  if (!client) return { success: false, error: 'Database client not configured' };
 
-  if (!targetClient) {
-    return res.status(500).json({ success: false, error: 'Database configuration missing on server.' });
+  const cleanKey = String(regData.licenseKey || regData.key || '').trim().toUpperCase();
+  const companyName = String(regData.companyName || regData.company || '').trim();
+  const email = String(regData.email || '').trim();
+  const phone = String(regData.phone || '').trim();
+  const tier = String(regData.tier || regData.plan || 'PRO').toUpperCase();
+  const nowIso = new Date().toISOString();
+
+  // Helper to check if error indicates already registered (unique constraint violation)
+  const isDuplicateError = (err) => err && (
+    err.code === '23505' ||
+    String(err.message || '').toLowerCase().includes('duplicate') ||
+    String(err.message || '').toLowerCase().includes('unique constraint')
+  );
+
+  // Attempt 1: Full payload matching both column naming conventions used by the License Key Studio dashboard
+  const fullPayload = {
+    license_key: cleanKey,
+    key: cleanKey,             // Some dashboards check 'key' instead of 'license_key'
+    company_name: companyName,
+    company: companyName,      // Ensure both variants exist
+    email: email,
+    phone: phone,
+    plan: tier,
+    tier: tier,
+    activated_at: nowIso,
+    created_at: nowIso
+  };
+
+  const { error: err1 } = await client.from('key_registrations').insert([fullPayload]);
+  if (!err1 || isDuplicateError(err1)) {
+    return { success: true, table: 'key_registrations', mode: 'full' };
   }
 
-  try {
-    const basePayload = {
-      company_name: companyName || '',
-      email: email || '',
-      phone: phone || '',
-      license_key: licenseKey || '',
-      plan: tier || 'ENTERPRISE',
-      activated_at: new Date().toISOString(),
-      created_at: new Date().toISOString()
+  console.warn('[syncKeyRegistration full payload error, retrying standard fallback]:', err1.message);
+
+  // Attempt 2: Required Fallback - retry inserting with only license_key, company_name, email, phone, plan, activated_at
+  const fallbackPayload = {
+    license_key: cleanKey,
+    company_name: companyName,
+    email: email,
+    phone: phone,
+    plan: tier,
+    activated_at: nowIso
+  };
+
+  const { error: err2 } = await client.from('key_registrations').insert([fallbackPayload]);
+  if (!err2 || isDuplicateError(err2)) {
+    return { success: true, table: 'key_registrations', mode: 'standard_snake' };
+  }
+
+  console.warn('[syncKeyRegistration fallback standard error]:', err2.message);
+
+  // Attempt 3: Alternative dashboard schema (key, company, tier, activated_at)
+  const altPayload = {
+    key: cleanKey,
+    company: companyName,
+    email: email,
+    phone: phone,
+    tier: tier,
+    activated_at: nowIso
+  };
+
+  const { error: err3 } = await client.from('key_registrations').insert([altPayload]);
+  if (!err3 || isDuplicateError(err3)) {
+    return { success: true, table: 'key_registrations', mode: 'alt_key_company' };
+  }
+
+  // Attempt 4: Minimal schema (license_key, email, phone)
+  const minPayload1 = { license_key: cleanKey, email: email, phone: phone };
+  const { error: err4a } = await client.from('key_registrations').insert([minPayload1]);
+  if (!err4a || isDuplicateError(err4a)) {
+    return { success: true, table: 'key_registrations', mode: 'min_license_key' };
+  }
+
+  const minPayload2 = { key: cleanKey, email: email, phone: phone };
+  const { error: err4b } = await client.from('key_registrations').insert([minPayload2]);
+  if (!err4b || isDuplicateError(err4b)) {
+    return { success: true, table: 'key_registrations', mode: 'min_key' };
+  }
+
+  // Attempt 5: Fallback to 'customers' table if key_registrations doesn't exist
+  if (err1?.code === 'PGRST205' || String(err1?.message || '').includes('key_registrations')) {
+    const custPayload = {
+      company_name: companyName,
+      company: companyName,
+      email: email,
+      phone: phone,
+      license_key: cleanKey,
+      plan: tier
     };
-
-    // 1. Try key_registrations with standard company_name
-    let { error: insErr } = await targetClient
-      .from('key_registrations')
-      .insert([basePayload]);
-
-    // 2. If schema expects 'company' instead of 'company_name' (PGRST204)
-    if (insErr && (insErr.code === 'PGRST204' || (insErr.message && insErr.message.includes('company_name')))) {
-      const altPayload = {
-        company: companyName || '',
-        email: email || '',
-        phone: phone || '',
-        license_key: licenseKey || '',
-        plan: tier || 'ENTERPRISE',
-        activated_at: new Date().toISOString(),
-        created_at: new Date().toISOString()
-      };
-      const retry = await targetClient.from('key_registrations').insert([altPayload]);
-      insErr = retry.error;
+    const { error: errCust } = await client.from('customers').insert([custPayload]);
+    if (!errCust || isDuplicateError(errCust)) {
+      return { success: true, table: 'customers' };
     }
-
-    // 3. If table 'key_registrations' not found (PGRST205), try 'customers' table
-    if (insErr && (insErr.code === 'PGRST205' || (insErr.message && insErr.message.includes('key_registrations')))) {
-      const retryCust = await targetClient.from('customers').insert([basePayload]);
-      insErr = retryCust.error;
-    }
-
-    if (insErr) {
-      console.warn('[POST /api/register insert warning]:', insErr.message);
-      return res.status(400).json({ success: false, error: insErr.message });
-    }
-
-    return res.status(200).json({ success: true, message: 'Customer registration saved successfully.' });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
   }
+
+  return { success: false, error: err2?.message || err1?.message };
+}
+
+app.post('/api/register', async (req, res) => {
+  const { companyName, company, email, phone, licenseKey, key, tier, plan } = req.body;
+  const rawKey = licenseKey || key;
+
+  if (!rawKey) {
+    return res.status(400).json({ success: false, error: 'licenseKey is required.' });
+  }
+
+  const cleanKey = String(rawKey).trim().toUpperCase();
+  const cName = String(companyName || company || '').trim();
+  const cEmail = String(email || '').trim();
+  const cPhone = String(phone || '').trim();
+  const cTier = String(tier || plan || 'PRO').toUpperCase();
+
+  const regData = {
+    licenseKey: cleanKey,
+    key: cleanKey,
+    companyName: cName,
+    company: cName,
+    email: cEmail,
+    phone: cPhone,
+    tier: cTier,
+    plan: cTier
+  };
+
+  const results = [];
+
+  // 1. Primary insert using supabaseCustomers client (or fallback supabaseLicenses)
+  const primaryClient = supabaseCustomers || supabaseLicenses;
+  if (primaryClient) {
+    const resPrimary = await syncKeyRegistration(primaryClient, regData);
+    results.push({ target: 'supabaseCustomers', ...resPrimary });
+  }
+
+  // 2. Also sync to supabaseLicenses if it is a distinct client instance
+  if (supabaseLicenses && supabaseLicenses !== primaryClient) {
+    const resLic = await syncKeyRegistration(supabaseLicenses, regData);
+    results.push({ target: 'supabaseLicenses', ...resLic });
+  }
+
+  const isSuccess = results.some(r => r.success);
+
+  if (isSuccess) {
+    console.log(`[POST /api/register] Successfully registered key ${cleanKey}:`, results);
+    return res.status(200).json({
+      success: true,
+      message: 'Registration recorded successfully.',
+      key: cleanKey,
+      details: results
+    });
+  }
+
+  console.error(`[POST /api/register failure for ${cleanKey}]:`, results);
+  return res.status(400).json({
+    success: false,
+    error: results[0]?.error || 'Failed to record registration in database.',
+    details: results
+  });
 });
 
 // Start Server
