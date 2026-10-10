@@ -56,16 +56,7 @@ function computeDurationExpiry(record, activatedAtDate) {
   let baseDate = activatedAtDate ? new Date(activatedAtDate) : new Date();
   if (isNaN(baseDate.getTime())) baseDate = new Date();
 
-  // If there is already a direct valid future expiration date
-  const directExpiry = record?.expires_at || record?.expiresAt || record?.expiration_date;
-  if (directExpiry) {
-    const parsed = new Date(directExpiry);
-    if (!isNaN(parsed.getTime()) && parsed.getTime() > baseDate.getTime()) {
-      return parsed.toISOString();
-    }
-  }
-
-  // 1. Explicit numerical columns
+  // 1. Check explicit numerical columns first: duration_days, duration_months, duration_years
   if (record?.duration_years && !isNaN(parseInt(record.duration_years, 10)) && parseInt(record.duration_years, 10) > 0) {
     const d = new Date(baseDate.getTime());
     d.setFullYear(d.getFullYear() + parseInt(record.duration_years, 10));
@@ -84,66 +75,61 @@ function computeDurationExpiry(record, activatedAtDate) {
     return d.toISOString();
   }
 
-  // 2. Parse text string (e.g., "12 Month(s)", "12 months", "12M", "6 months", "1 Year", "1Y", "30 Days")
-  const rawDurationStr = record?.duration || record?.plan_duration || record?.validity || '';
+  // 2. Parse text strings like "12 Month(s)", "12M", "6 months", "1 Year", "365 days"
+  const rawDurationStr = record?.duration || record?.plan_duration || record?.validity || record?.duration_text || '';
   if (rawDurationStr) {
     const str = String(rawDurationStr).trim().toLowerCase();
-    const match = str.match(/(\d+)\s*([a-zA-Z\(\)]+)?/);
+    const match = str.match(/(\d+)\s*([a-zA-Z\(\)]*)/);
     if (match) {
       const num = parseInt(match[1], 10);
       const unit = (match[2] || '').toLowerCase();
       if (!isNaN(num) && num > 0) {
         const d = new Date(baseDate.getTime());
+        // If year or Y: add years
         if (unit.includes('year') || unit.includes('yr') || unit === 'y' || str.includes('year')) {
           d.setFullYear(d.getFullYear() + num);
           return d.toISOString();
-        } else if (unit.includes('month') || unit.includes('mon') || unit === 'm' || str.includes('month')) {
+        }
+        // If month or M: add months (Do NOT fall back to 30 days)
+        if (unit.includes('month') || unit.includes('mon') || unit.startsWith('m') || str.includes('month')) {
           d.setMonth(d.getMonth() + num);
           return d.toISOString();
-        } else if (unit.includes('day') || unit.includes('d') || str.includes('day')) {
+        }
+        // If day or D: add days
+        if (unit.includes('day') || unit.includes('d') || str.includes('day')) {
           d.setDate(d.getDate() + num);
           return d.toISOString();
-        } else {
-          if (num <= 12) {
-            d.setMonth(d.getMonth() + num);
-          } else {
-            d.setDate(d.getDate() + num);
-          }
-          return d.toISOString();
         }
+        // Fallback for number without explicit unit
+        if (num <= 12) {
+          d.setMonth(d.getMonth() + num);
+        } else {
+          d.setDate(d.getDate() + num);
+        }
+        return d.toISOString();
       }
     }
   }
 
-  // 3. License key prefix/pattern fallback (e.g. PRO-12M-..., ENTERPRISE-6M-..., PRO-1Y-...)
+  // 3. Regex fallback directly matching the license key string itself
   const keyStr = String(record?.license_key || record?.key || '').toUpperCase();
   if (keyStr) {
     const d = new Date(baseDate.getTime());
-    const mMatch = keyStr.match(/-(\d+)\s*M(?:ONTH)?-/i) || keyStr.match(/-(\d+)M\b/i);
-    if (mMatch && mMatch[1]) {
-      const months = parseInt(mMatch[1], 10);
-      if (!isNaN(months) && months > 0) {
-        d.setMonth(d.getMonth() + months);
-        return d.toISOString();
-      }
+    if (keyStr.includes('-12M-') || keyStr.includes('-1Y-') || /-12M\b/i.test(keyStr) || /-1Y\b/i.test(keyStr)) {
+      d.setFullYear(d.getFullYear() + 1);
+      return d.toISOString();
     }
-
-    const yMatch = keyStr.match(/-(\d+)\s*Y(?:EAR)?-/i) || keyStr.match(/-(\d+)Y\b/i);
-    if (yMatch && yMatch[1]) {
-      const years = parseInt(yMatch[1], 10);
-      if (!isNaN(years) && years > 0) {
-        d.setFullYear(d.getFullYear() + years);
-        return d.toISOString();
-      }
+    if (keyStr.includes('-6M-') || /-6M\b/i.test(keyStr)) {
+      d.setMonth(d.getMonth() + 6);
+      return d.toISOString();
     }
-
-    const dMatch = keyStr.match(/-(\d+)\s*D(?:AY)?-/i) || keyStr.match(/-(\d+)D\b/i);
-    if (dMatch && dMatch[1]) {
-      const days = parseInt(dMatch[1], 10);
-      if (!isNaN(days) && days > 0) {
-        d.setDate(d.getDate() + days);
-        return d.toISOString();
-      }
+    if (keyStr.includes('-3M-') || /-3M\b/i.test(keyStr)) {
+      d.setMonth(d.getMonth() + 3);
+      return d.toISOString();
+    }
+    if (keyStr.includes('-1M-') || /-1M\b/i.test(keyStr)) {
+      d.setMonth(d.getMonth() + 1);
+      return d.toISOString();
     }
   }
 
