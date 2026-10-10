@@ -756,7 +756,7 @@ app.post('/api/activate', async (req, res) => {
 
 // -----------------------------------------------------------------------------
 // Helper: Multi-Database Registration Synchronizer
-// Handles all dashboard column variations ('key' vs 'license_key', 'company' vs 'company_name', 'tier' vs 'plan')
+// Primary target: key_registrations (with isolated optional sync to customers)
 // -----------------------------------------------------------------------------
 async function syncKeyRegistration(client, regData) {
   if (!client) return { success: false, error: 'Database client not configured' };
@@ -775,8 +775,8 @@ async function syncKeyRegistration(client, regData) {
     String(err.message || '').toLowerCase().includes('unique constraint')
   );
 
-  // Attempt 1: Full payload matching both column naming conventions used by the License Key Studio dashboard
-  const fullPayload = {
+  // Full payload with all alias fields populated
+  const payload = {
     license_key: cleanKey,
     key: cleanKey,             // Some dashboards check 'key' instead of 'license_key'
     company_name: companyName,
@@ -789,75 +789,68 @@ async function syncKeyRegistration(client, regData) {
     created_at: nowIso
   };
 
-  const { error: err1 } = await client.from('key_registrations').insert([fullPayload]);
-  if (!err1 || isDuplicateError(err1)) {
-    return { success: true, table: 'key_registrations', mode: 'full' };
-  }
+  let registeredOk = false;
+  let lastError = null;
 
-  console.warn('[syncKeyRegistration full payload error, retrying standard fallback]:', err1.message);
+  // 1. Primary Target: key_registrations
+  try {
+    const { error: err1 } = await client.from('key_registrations').insert([payload]);
+    if (!err1 || isDuplicateError(err1)) {
+      registeredOk = true;
+    } else {
+      console.warn('[syncKeyRegistration key_registrations full payload warning]:', err1.message);
+      lastError = err1.message;
 
-  // Attempt 2: Required Fallback - retry inserting with only license_key, company_name, email, phone, plan, activated_at
-  const fallbackPayload = {
-    license_key: cleanKey,
-    company_name: companyName,
-    email: email,
-    phone: phone,
-    plan: tier,
-    activated_at: nowIso
-  };
+      // Retry with standard snake_case columns
+      const fallbackPayload = {
+        license_key: cleanKey,
+        company_name: companyName,
+        email: email,
+        phone: phone,
+        plan: tier,
+        activated_at: nowIso
+      };
+      const { error: err2 } = await client.from('key_registrations').insert([fallbackPayload]);
+      if (!err2 || isDuplicateError(err2)) {
+        registeredOk = true;
+      } else {
+        console.warn('[syncKeyRegistration key_registrations fallback warning]:', err2.message);
+        lastError = err2.message;
 
-  const { error: err2 } = await client.from('key_registrations').insert([fallbackPayload]);
-  if (!err2 || isDuplicateError(err2)) {
-    return { success: true, table: 'key_registrations', mode: 'standard_snake' };
-  }
-
-  console.warn('[syncKeyRegistration fallback standard error]:', err2.message);
-
-  // Attempt 3: Alternative dashboard schema (key, company, tier, activated_at)
-  const altPayload = {
-    key: cleanKey,
-    company: companyName,
-    email: email,
-    phone: phone,
-    tier: tier,
-    activated_at: nowIso
-  };
-
-  const { error: err3 } = await client.from('key_registrations').insert([altPayload]);
-  if (!err3 || isDuplicateError(err3)) {
-    return { success: true, table: 'key_registrations', mode: 'alt_key_company' };
-  }
-
-  // Attempt 4: Minimal schema (license_key, email, phone)
-  const minPayload1 = { license_key: cleanKey, email: email, phone: phone };
-  const { error: err4a } = await client.from('key_registrations').insert([minPayload1]);
-  if (!err4a || isDuplicateError(err4a)) {
-    return { success: true, table: 'key_registrations', mode: 'min_license_key' };
-  }
-
-  const minPayload2 = { key: cleanKey, email: email, phone: phone };
-  const { error: err4b } = await client.from('key_registrations').insert([minPayload2]);
-  if (!err4b || isDuplicateError(err4b)) {
-    return { success: true, table: 'key_registrations', mode: 'min_key' };
-  }
-
-  // Attempt 5: Fallback to 'customers' table if key_registrations doesn't exist
-  if (err1?.code === 'PGRST205' || String(err1?.message || '').includes('key_registrations')) {
-    const custPayload = {
-      company_name: companyName,
-      company: companyName,
-      email: email,
-      phone: phone,
-      license_key: cleanKey,
-      plan: tier
-    };
-    const { error: errCust } = await client.from('customers').insert([custPayload]);
-    if (!errCust || isDuplicateError(errCust)) {
-      return { success: true, table: 'customers' };
+        // Retry with alt columns (key, company, tier)
+        const altPayload = {
+          key: cleanKey,
+          company: companyName,
+          email: email,
+          phone: phone,
+          tier: tier,
+          activated_at: nowIso
+        };
+        const { error: err3 } = await client.from('key_registrations').insert([altPayload]);
+        if (!err3 || isDuplicateError(err3)) {
+          registeredOk = true;
+        } else {
+          lastError = err3.message;
+        }
+      }
     }
+  } catch (errKeyReg) {
+    lastError = errKeyReg.message;
+    console.warn('[syncKeyRegistration key_registrations exception]:', errKeyReg.message);
   }
 
-  return { success: false, error: err2?.message || err1?.message };
+  // 2. Safe Optional Sync: customers table (isolated in its own try/catch so it never breaks registration)
+  try {
+    await client.from('customers').insert([payload]);
+  } catch (custErr) {
+    console.warn('[syncKeyRegistration customers optional sync notice]:', custErr.message);
+  }
+
+  if (registeredOk) {
+    return { success: true, table: 'key_registrations' };
+  }
+
+  return { success: false, error: lastError || 'Failed to insert into key_registrations' };
 }
 
 app.post('/api/register', async (req, res) => {
@@ -887,14 +880,14 @@ app.post('/api/register', async (req, res) => {
 
   const results = [];
 
-  // 1. Primary insert using supabaseCustomers client (or fallback supabaseLicenses)
+  // Primary: supabaseCustomers client (or fallback supabaseLicenses)
   const primaryClient = supabaseCustomers || supabaseLicenses;
   if (primaryClient) {
     const resPrimary = await syncKeyRegistration(primaryClient, regData);
     results.push({ target: 'supabaseCustomers', ...resPrimary });
   }
 
-  // 2. Also sync to supabaseLicenses if it is a distinct client instance
+  // Also sync to supabaseLicenses if separate
   if (supabaseLicenses && supabaseLicenses !== primaryClient) {
     const resLic = await syncKeyRegistration(supabaseLicenses, regData);
     results.push({ target: 'supabaseLicenses', ...resLic });
@@ -906,7 +899,7 @@ app.post('/api/register', async (req, res) => {
     console.log(`[POST /api/register] Successfully registered key ${cleanKey}:`, results);
     return res.status(200).json({
       success: true,
-      message: 'Registration recorded successfully.',
+      message: 'Registration saved',
       key: cleanKey,
       details: results
     });
