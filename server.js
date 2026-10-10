@@ -50,7 +50,111 @@ app.get('/', (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// 2. License Authentication Middleware (authenticateLicense)
+// 2. Robust Duration & Expiration Parsing Helper
+// -----------------------------------------------------------------------------
+function computeDurationExpiry(record, activatedAtDate) {
+  let baseDate = activatedAtDate ? new Date(activatedAtDate) : new Date();
+  if (isNaN(baseDate.getTime())) baseDate = new Date();
+
+  // If there is already a direct valid future expiration date
+  const directExpiry = record?.expires_at || record?.expiresAt || record?.expiration_date;
+  if (directExpiry) {
+    const parsed = new Date(directExpiry);
+    if (!isNaN(parsed.getTime()) && parsed.getTime() > baseDate.getTime()) {
+      return parsed.toISOString();
+    }
+  }
+
+  // 1. Explicit numerical columns
+  if (record?.duration_years && !isNaN(parseInt(record.duration_years, 10)) && parseInt(record.duration_years, 10) > 0) {
+    const d = new Date(baseDate.getTime());
+    d.setFullYear(d.getFullYear() + parseInt(record.duration_years, 10));
+    return d.toISOString();
+  }
+
+  if (record?.duration_months && !isNaN(parseInt(record.duration_months, 10)) && parseInt(record.duration_months, 10) > 0) {
+    const d = new Date(baseDate.getTime());
+    d.setMonth(d.getMonth() + parseInt(record.duration_months, 10));
+    return d.toISOString();
+  }
+
+  if (record?.duration_days && !isNaN(parseInt(record.duration_days, 10)) && parseInt(record.duration_days, 10) > 0) {
+    const d = new Date(baseDate.getTime());
+    d.setDate(d.getDate() + parseInt(record.duration_days, 10));
+    return d.toISOString();
+  }
+
+  // 2. Parse text string (e.g., "12 Month(s)", "12 months", "12M", "6 months", "1 Year", "1Y", "30 Days")
+  const rawDurationStr = record?.duration || record?.plan_duration || record?.validity || '';
+  if (rawDurationStr) {
+    const str = String(rawDurationStr).trim().toLowerCase();
+    const match = str.match(/(\d+)\s*([a-zA-Z\(\)]+)?/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      const unit = (match[2] || '').toLowerCase();
+      if (!isNaN(num) && num > 0) {
+        const d = new Date(baseDate.getTime());
+        if (unit.includes('year') || unit.includes('yr') || unit === 'y' || str.includes('year')) {
+          d.setFullYear(d.getFullYear() + num);
+          return d.toISOString();
+        } else if (unit.includes('month') || unit.includes('mon') || unit === 'm' || str.includes('month')) {
+          d.setMonth(d.getMonth() + num);
+          return d.toISOString();
+        } else if (unit.includes('day') || unit.includes('d') || str.includes('day')) {
+          d.setDate(d.getDate() + num);
+          return d.toISOString();
+        } else {
+          if (num <= 12) {
+            d.setMonth(d.getMonth() + num);
+          } else {
+            d.setDate(d.getDate() + num);
+          }
+          return d.toISOString();
+        }
+      }
+    }
+  }
+
+  // 3. License key prefix/pattern fallback (e.g. PRO-12M-..., ENTERPRISE-6M-..., PRO-1Y-...)
+  const keyStr = String(record?.license_key || record?.key || '').toUpperCase();
+  if (keyStr) {
+    const d = new Date(baseDate.getTime());
+    const mMatch = keyStr.match(/-(\d+)\s*M(?:ONTH)?-/i) || keyStr.match(/-(\d+)M\b/i);
+    if (mMatch && mMatch[1]) {
+      const months = parseInt(mMatch[1], 10);
+      if (!isNaN(months) && months > 0) {
+        d.setMonth(d.getMonth() + months);
+        return d.toISOString();
+      }
+    }
+
+    const yMatch = keyStr.match(/-(\d+)\s*Y(?:EAR)?-/i) || keyStr.match(/-(\d+)Y\b/i);
+    if (yMatch && yMatch[1]) {
+      const years = parseInt(yMatch[1], 10);
+      if (!isNaN(years) && years > 0) {
+        d.setFullYear(d.getFullYear() + years);
+        return d.toISOString();
+      }
+    }
+
+    const dMatch = keyStr.match(/-(\d+)\s*D(?:AY)?-/i) || keyStr.match(/-(\d+)D\b/i);
+    if (dMatch && dMatch[1]) {
+      const days = parseInt(dMatch[1], 10);
+      if (!isNaN(days) && days > 0) {
+        d.setDate(d.getDate() + days);
+        return d.toISOString();
+      }
+    }
+  }
+
+  // 4. Default fallback: 30 days
+  const fallbackDate = new Date(baseDate.getTime());
+  fallbackDate.setDate(fallbackDate.getDate() + 30);
+  return fallbackDate.toISOString();
+}
+
+// -----------------------------------------------------------------------------
+// 3. License Authentication Middleware (authenticateLicense)
 // -----------------------------------------------------------------------------
 async function authenticateLicense(req, res, next) {
   const licenseKey = req.headers['x-license-key'];
@@ -112,7 +216,7 @@ async function authenticateLicense(req, res, next) {
     }
 
     // Check if key is marked as redeemed
-    if (license.is_redeemed === false) {
+    if (license.is_redeemed === false && license.status === 'available') {
       return res.status(403).json({
         success: false,
         error: 'Forbidden: License key has not been activated or redeemed.'
@@ -120,7 +224,7 @@ async function authenticateLicense(req, res, next) {
     }
 
     // B. Query key_registrations to verify activated_at & subscription expiration
-    let activatedAt = license.redeemed_at || license.activated_at || license.created_at;
+    let activatedAt = license.activated_at || license.redeemed_at || license.created_at;
     let expiresAt = license.expires_at || license.expiresAt || null;
 
     try {
@@ -145,24 +249,9 @@ async function authenticateLicense(req, res, next) {
       console.warn('[authenticateLicense registration query warning]:', e.message);
     }
 
-    // Compute expiration date if not directly provided
-    if (!expiresAt && activatedAt) {
-      const actTime = new Date(activatedAt).getTime();
-      let durationDays = 30; // fallback 30 days
-
-      if (license.duration_days) {
-        durationDays = parseInt(license.duration_days, 10);
-      } else if (license.duration_months) {
-        durationDays = parseInt(license.duration_months, 10) * 30;
-      } else if (license.duration) {
-        const match = String(license.duration).match(/(\d+)\s*([a-zA-Z]+)?/);
-        if (match) {
-          const val = parseInt(match[1], 10);
-          const unit = (match[2] || 'days').toLowerCase();
-          durationDays = unit.startsWith('month') ? val * 30 : val;
-        }
-      }
-      expiresAt = new Date(actTime + durationDays * 24 * 60 * 60 * 1000).toISOString();
+    // Compute expiration date using shared robust helper
+    if (!expiresAt) {
+      expiresAt = computeDurationExpiry(license, activatedAt || new Date());
     }
 
     // Check expiration timestamp
@@ -545,32 +634,6 @@ app.post('/api/process', authenticateLicense, (req, res) => {
 // 5. License Activation & Registration Endpoints (Zero Client-Side Credentials)
 // -----------------------------------------------------------------------------
 
-function computeDurationExpiry(record) {
-  const now = new Date();
-  const directExpiry = record?.expires_at || record?.expiresAt || record?.expiration_date;
-  if (directExpiry) {
-    const parsed = new Date(directExpiry);
-    if (!isNaN(parsed.getTime())) return parsed.toISOString();
-  }
-
-  let durationDays = 30;
-  if (record?.duration_days) {
-    durationDays = parseInt(record.duration_days, 10);
-  } else if (record?.duration_months) {
-    durationDays = parseInt(record.duration_months, 10) * 30;
-  } else if (record?.duration) {
-    const match = String(record.duration).match(/(\d+)\s*([a-zA-Z]+)?/);
-    if (match) {
-      const val = parseInt(match[1], 10);
-      const unit = (match[2] || 'days').toLowerCase();
-      durationDays = unit.startsWith('month') ? val * 30 : val;
-    }
-  }
-
-  const expires = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
-  return expires.toISOString();
-}
-
 app.post('/api/activate', async (req, res) => {
   const { licenseKey, email } = req.body;
   if (!licenseKey || typeof licenseKey !== 'string') {
@@ -618,30 +681,58 @@ app.post('/api/activate', async (req, res) => {
       }
     }
 
-    // Mark redeemed if not already redeemed
-    if (!record.is_redeemed) {
-      try {
+    const nowIso = new Date().toISOString();
+    const finalExpiry = computeDurationExpiry(record, new Date());
+
+    // Update license_keys to mark as REDEEMED and save expiration
+    const updatePayload = {
+      is_redeemed: true,
+      status: 'redeemed',
+      redeemed_by: email || null,
+      redeemed_at: nowIso,
+      activated_at: nowIso,
+      expires_at: finalExpiry
+    };
+
+    // First attempt: full update
+    const { error: updErr1 } = await supabaseLicenses
+      .from('license_keys')
+      .update(updatePayload)
+      .eq('license_key', cleanKey);
+
+    if (updErr1) {
+      console.warn('[Activation full update warning]:', updErr1.message);
+      // Fallback: minimal safe update for is_redeemed & status
+      const minPayload = {
+        is_redeemed: true,
+        status: 'redeemed'
+      };
+      if (email) minPayload.redeemed_by = email;
+
+      const { error: updErr2 } = await supabaseLicenses
+        .from('license_keys')
+        .update(minPayload)
+        .eq('license_key', cleanKey);
+
+      if (updErr2) {
+        console.warn('[Activation minimal update warning]:', updErr2.message);
+        // Fallback: just is_redeemed
         await supabaseLicenses
           .from('license_keys')
-          .update({
-            is_redeemed: true,
-            redeemed_by: email || null,
-            redeemed_at: new Date().toISOString()
-          })
-          .eq('id', record.id);
-      } catch (e) {
-        console.warn('[Activation update warning]:', e.message);
+          .update({ is_redeemed: true })
+          .eq('license_key', cleanKey);
       }
     }
 
-    const finalExpiry = computeDurationExpiry(record);
+    const daysRemaining = Math.max(1, Math.ceil((new Date(finalExpiry).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
 
     return res.status(200).json({
       valid: true,
       tier: (record.tier || record.plan || 'ENTERPRISE').toUpperCase(),
-      duration: record.duration || '30 days',
-      duration_days: record.duration_days || 30,
+      duration: record.duration || record.plan_duration || '12 Month(s)',
+      duration_days: record.duration_days || daysRemaining,
       expires_at: finalExpiry,
+      days_remaining: daysRemaining,
       features: record.features || null
     });
   } catch (err) {
