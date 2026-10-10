@@ -76,7 +76,7 @@ async function authenticateLicense(req, res, next) {
     const { data: licenseRows, error: licenseError } = await supabaseLicenses
       .from('license_keys')
       .select('*')
-      .or(`license_key.eq.${cleanKey},key.eq.${cleanKey}`)
+      .eq('license_key', cleanKey)
       .limit(1);
 
     if (licenseError) {
@@ -129,7 +129,7 @@ async function authenticateLicense(req, res, next) {
         const { data: regRows } = await targetClient
           .from('key_registrations')
           .select('*')
-          .or(`license_key.eq.${cleanKey},key.eq.${cleanKey}`)
+          .eq('license_key', cleanKey)
           .limit(1);
 
         if (regRows && regRows.length > 0) {
@@ -590,7 +590,7 @@ app.post('/api/activate', async (req, res) => {
     const { data: rows, error: qErr } = await supabaseLicenses
       .from('license_keys')
       .select('*')
-      .or(`license_key.eq.${cleanKey},key.eq.${cleanKey}`)
+      .eq('license_key', cleanKey)
       .limit(1);
 
     if (qErr) {
