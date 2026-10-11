@@ -15,12 +15,12 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // --- Supabase Project 1 (License Keys) ---
-const LICENSES_URL = process.env.LICENSES_URL || process.env.SUPABASE_URL;
-const LICENSES_KEY = process.env.LICENSES_KEY || process.env.SUPABASE_KEY;
+const LICENSES_URL = process.env.LICENSES_URL || process.env.SUPABASE_URL || 'https://mvxqxvixvkcdtwvyaqwh.supabase.co';
+const LICENSES_KEY = process.env.LICENSES_KEY || process.env.SUPABASE_KEY || 'sb_secret_eL7B4R0m1WoxpcJuZWWjNQ_0qOWBWhO';
 
 // --- Supabase Project 2 (Customer Registrations) ---
-const CUSTOMERS_URL = process.env.CUSTOMERS_URL || process.env.CUSTOMER_SUPABASE_URL;
-const CUSTOMERS_KEY = process.env.CUSTOMERS_KEY || process.env.CUSTOMER_SUPABASE_KEY;
+const CUSTOMERS_URL = process.env.CUSTOMERS_URL || process.env.CUSTOMER_SUPABASE_URL || 'https://lewkfomzjnmshgikeral.supabase.co';
+const CUSTOMERS_KEY = process.env.CUSTOMERS_KEY || process.env.CUSTOMER_SUPABASE_KEY || 'sb_secret_-XIZIvgtW2vtzZyR-_Xf5A_QbQmhqNK';
 
 const supabaseLicenses = (LICENSES_URL && LICENSES_KEY) ? createClient(LICENSES_URL, LICENSES_KEY, { auth: { persistSession: false } }) : null;
 const supabaseCustomers = (CUSTOMERS_URL && CUSTOMERS_KEY) ? createClient(CUSTOMERS_URL, CUSTOMERS_KEY, { auth: { persistSession: false } }) : supabaseLicenses;
@@ -726,14 +726,20 @@ app.post('/api/activate', async (req, res) => {
 
     const daysRemaining = Math.max(1, Math.ceil((new Date(finalExpiry).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
 
+    const resolvedTier = String(record.tier || record.plan || 'PRO').toUpperCase();
+    const isEnt = resolvedTier === 'ENTERPRISE';
+    const defaultFeatures = isEnt
+      ? ['Full Access', 'A-Rank Booster', 'Unlimited Keywords', 'Fast Polling']
+      : ['Standard Lead Picking', 'Keywords Filter', 'Auto-Refresh'];
+
     return res.status(200).json({
       valid: true,
-      tier: (record.tier || record.plan || 'ENTERPRISE').toUpperCase(),
+      tier: resolvedTier,
       duration: record.duration || record.plan_duration || '12 Month(s)',
       duration_days: record.duration_days || daysRemaining,
       expires_at: finalExpiry,
       days_remaining: daysRemaining,
-      features: record.features || null
+      features: record.features || defaultFeatures
     });
   } catch (err) {
     return res.status(500).json({ valid: false, message: err.message });
@@ -742,101 +748,106 @@ app.post('/api/activate', async (req, res) => {
 
 // -----------------------------------------------------------------------------
 // Helper: Multi-Database Registration Synchronizer
-// Primary target: key_registrations (with isolated optional sync to customers)
-// -----------------------------------------------------------------------------
-async function syncKeyRegistration(client, regData) {
-  if (!client) return { success: false, error: 'Database client not configured' };
-
-  const cleanKey = String(regData.licenseKey || regData.key || '').trim().toUpperCase();
-  const companyName = String(regData.companyName || regData.company || '').trim();
-  const email = String(regData.email || '').trim();
-  const phone = String(regData.phone || '').trim();
-  const tier = String(regData.tier || regData.plan || 'PRO').toUpperCase();
-  const nowIso = new Date().toISOString();
-
-  // Helper to check if error indicates already registered (unique constraint violation)
+// Helper: Dynamic PostgREST insert with automatic column pruning
+async function insertWithPruning(client, table, initialData) {
+  let data = { ...initialData };
   const isDuplicateError = (err) => err && (
     err.code === '23505' ||
     String(err.message || '').toLowerCase().includes('duplicate') ||
     String(err.message || '').toLowerCase().includes('unique constraint')
   );
 
-  // Full payload with all alias fields populated
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      const { error } = await client.from(table).insert([data]);
+      if (!error || isDuplicateError(error)) {
+        return { success: true };
+      }
+
+      const msg = error.message || '';
+      // Detect PostgREST missing column error: "Could not find the 'xyz' column of 'table' in the schema cache"
+      const missingColMatch = msg.match(/Could not find the ['"]([^'"]+)['"] column/i);
+      if (missingColMatch && missingColMatch[1]) {
+        const badCol = missingColMatch[1];
+        delete data[badCol];
+
+        // Intelligent column fallbacks if specific name was rejected
+        if (badCol === 'company' && !data.company_name && (initialData.company || initialData.companyName)) {
+          data.company_name = initialData.company || initialData.companyName;
+        } else if (badCol === 'company_name' && !data.company && (initialData.company_name || initialData.companyName)) {
+          data.company = initialData.company_name || initialData.companyName;
+        }
+
+        if (Object.keys(data).length === 0) {
+          return { success: false, error: msg };
+        }
+        continue;
+      }
+
+      return { success: false, error: msg };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  }
+  return { success: false, error: 'Maximum retry attempts reached during column pruning' };
+}
+
+async function syncKeyRegistration(client, regData) {
+  if (!client) return { success: false, error: 'Database client not configured' };
+
+  const cleanKey = String(regData.licenseKey || regData.key || '').trim().toUpperCase();
+  const companyName = String(regData.companyName || regData.company || '').trim();
+  const email = String(regData.email || '').trim();
+  const phone = String(regData.phone || regData.phoneNumber || regData.phone_number || regData.mobile || '').trim();
+  const nowIso = new Date().toISOString();
+
   const payload = {
     license_key: cleanKey,
-    key: cleanKey,             // Some dashboards check 'key' instead of 'license_key'
     company_name: companyName,
-    company: companyName,      // Ensure both variants exist
     email: email,
-    phone: phone,
-    plan: tier,
-    tier: tier,
-    activated_at: nowIso,
-    created_at: nowIso
+    phone_number: phone,
+    activated_at: nowIso
   };
 
-  let registeredOk = false;
-  let lastError = null;
-
-  // 1. Primary Target: key_registrations
+  // 1. Check if row exists in key_registrations, then update or insert
   try {
-    const { error: err1 } = await client.from('key_registrations').insert([payload]);
-    if (!err1 || isDuplicateError(err1)) {
-      registeredOk = true;
-    } else {
-      console.warn('[syncKeyRegistration key_registrations full payload warning]:', err1.message);
-      lastError = err1.message;
+    const { data: existing, error: checkErr } = await client
+      .from('key_registrations')
+      .select('id')
+      .eq('license_key', cleanKey)
+      .limit(1);
 
-      // Retry with standard snake_case columns
-      const fallbackPayload = {
-        license_key: cleanKey,
-        company_name: companyName,
-        email: email,
-        phone: phone,
-        plan: tier,
-        activated_at: nowIso
-      };
-      const { error: err2 } = await client.from('key_registrations').insert([fallbackPayload]);
-      if (!err2 || isDuplicateError(err2)) {
-        registeredOk = true;
-      } else {
-        console.warn('[syncKeyRegistration key_registrations fallback warning]:', err2.message);
-        lastError = err2.message;
-
-        // Retry with alt columns (key, company, tier)
-        const altPayload = {
-          key: cleanKey,
-          company: companyName,
+    if (!checkErr && Array.isArray(existing) && existing.length > 0) {
+      const { error: updErr } = await client
+        .from('key_registrations')
+        .update({
+          company_name: companyName,
           email: email,
-          phone: phone,
-          tier: tier,
+          phone_number: phone,
           activated_at: nowIso
-        };
-        const { error: err3 } = await client.from('key_registrations').insert([altPayload]);
-        if (!err3 || isDuplicateError(err3)) {
-          registeredOk = true;
-        } else {
-          lastError = err3.message;
-        }
+        })
+        .eq('license_key', cleanKey);
+      if (!updErr) {
+        return { success: true, table: 'key_registrations', action: 'updated' };
       }
     }
-  } catch (errKeyReg) {
-    lastError = errKeyReg.message;
-    console.warn('[syncKeyRegistration key_registrations exception]:', errKeyReg.message);
+  } catch (_) {}
+
+  // 2. Insert into key_registrations
+  const regResult = await insertWithPruning(client, 'key_registrations', payload);
+  if (regResult.success) {
+    return { success: true, table: 'key_registrations', action: 'inserted' };
   }
 
-  // 2. Safe Optional Sync: customers table (isolated in its own try/catch so it never breaks registration)
+  // 3. Fallback: try customers table if available
   try {
-    await client.from('customers').insert([payload]);
-  } catch (custErr) {
-    console.warn('[syncKeyRegistration customers optional sync notice]:', custErr.message);
-  }
+    const custResult = await insertWithPruning(client, 'customers', payload);
+    if (custResult.success) {
+      return { success: true, table: 'customers' };
+    }
+  } catch (_) {}
 
-  if (registeredOk) {
-    return { success: true, table: 'key_registrations' };
-  }
-
-  return { success: false, error: lastError || 'Failed to insert into key_registrations' };
+  return { success: false, error: regResult.error || 'Failed to record registration.' };
 }
 
 app.post('/api/register', async (req, res) => {
