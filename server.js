@@ -15,12 +15,13 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // --- Supabase Project 1 (License Keys) ---
-const LICENSES_URL = process.env.LICENSES_URL || process.env.SUPABASE_URL || 'https://mvxqxvixvkcdtwvyaqwh.supabase.co';
-const LICENSES_KEY = process.env.LICENSES_KEY || process.env.SUPABASE_KEY || 'sb_secret_eL7B4R0m1WoxpcJuZWWjNQ_0qOWBWhO';
+// --- Supabase Project 1 (Licenses) ---
+const LICENSES_URL = process.env.LICENSES_URL || process.env.SUPABASE_URL || '';
+const LICENSES_KEY = process.env.LICENSES_KEY || process.env.SUPABASE_KEY || '';
 
 // --- Supabase Project 2 (Customer Registrations) ---
-const CUSTOMERS_URL = process.env.CUSTOMERS_URL || process.env.CUSTOMER_SUPABASE_URL || 'https://lewkfomzjnmshgikeral.supabase.co';
-const CUSTOMERS_KEY = process.env.CUSTOMERS_KEY || process.env.CUSTOMER_SUPABASE_KEY || 'sb_secret_-XIZIvgtW2vtzZyR-_Xf5A_QbQmhqNK';
+const CUSTOMERS_URL = process.env.CUSTOMERS_URL || process.env.CUSTOMER_SUPABASE_URL || '';
+const CUSTOMERS_KEY = process.env.CUSTOMERS_KEY || process.env.CUSTOMER_SUPABASE_KEY || '';
 
 const supabaseLicenses = (LICENSES_URL && LICENSES_KEY) ? createClient(LICENSES_URL, LICENSES_KEY, { auth: { persistSession: false } }) : null;
 const supabaseCustomers = (CUSTOMERS_URL && CUSTOMERS_KEY) ? createClient(CUSTOMERS_URL, CUSTOMERS_KEY, { auth: { persistSession: false } }) : supabaseLicenses;
@@ -831,7 +832,7 @@ async function syncKeyRegistration(client, regData) {
         return { success: true, table: 'key_registrations', action: 'updated' };
       }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   // 2. Insert into key_registrations
   const regResult = await insertWithPruning(client, 'key_registrations', payload);
@@ -845,7 +846,7 @@ async function syncKeyRegistration(client, regData) {
     if (custResult.success) {
       return { success: true, table: 'customers' };
     }
-  } catch (_) {}
+  } catch (_) { }
 
   return { success: false, error: regResult.error || 'Failed to record registration.' };
 }
